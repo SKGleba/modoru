@@ -17,51 +17,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "spkg.h"
-
 #define APP_PATH "ux0:app/MODORU000/"
 
 #define MOD_LIST_SIZE 128
-
-#define NZERO_RANGE(off, end, ctx) \
-	do { \
-		int curr = 0; \
-		while (off + curr < end + 4) { \
-			nzero32((off + curr), ctx); \
-			curr = curr + 4; \
-		} \
-} while (0)
-
-typedef struct {
-  void *addr;
-  uint32_t length;
-} __attribute__((packed)) region_t;
-
-typedef struct {
-  uint32_t unused_0[2];
-  uint32_t use_lv2_mode_0; // if 1, use lv2 list
-  uint32_t use_lv2_mode_1; // if 1, use lv2 list
-  uint32_t unused_10[3];
-  uint32_t list_count; // must be < 0x1F1
-  uint32_t unused_20[4];
-  uint32_t total_count; // only used in LV1 mode
-  uint32_t unused_34[1];
-  union {
-    region_t lv1[0x1F1];
-    region_t lv2[0x1F1];
-  } list;
-} __attribute__((packed)) cmd_0x50002_t;
-
-typedef struct heap_hdr {
-  void *data;
-  uint32_t size;
-  uint32_t size_aligned;
-  uint32_t padding;
-  struct heap_hdr *prev;
-  struct heap_hdr *next;
-} __attribute__((packed)) heap_hdr_t;
-
-cmd_0x50002_t cargs;
 
 int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uint32_t funcnid, uintptr_t *func);
 
@@ -71,14 +29,12 @@ static tai_hook_ref_t ksceKernelStartPreloadedModulesRef;
 static tai_hook_ref_t ksceSblACMgrIsDevelopmentModeRef;
 static tai_hook_ref_t SceSysrootForDriver_421EFC96_ref;
 static tai_hook_ref_t SceSysrootForDriver_55392965_ref;
-static tai_hook_ref_t ksceSblSsInfraAllocatePARangeVectorRef;
-static tai_hook_ref_t ksceKernelAllocHeapMemoryRef;
-static tai_hook_ref_t ksceKernelFreeHeapMemoryRef;
 static tai_hook_ref_t ksceSblSmCommCallFuncRef;
 
-static SceUID hooks[8];
+#include "lv0.h"
 
-static int doInject = 0;
+static SceUID hooks[5];
+static int newFw = 0, skipSoftMin = 0;
 
 static int ksceKernelStartPreloadedModulesPatched(SceUID pid) {
   int res = TAI_CONTINUE(int, ksceKernelStartPreloadedModulesRef, pid);
@@ -109,77 +65,26 @@ static int SceSysrootForDriver_55392965_patched(void) {
   return 1;
 }
 
-static void *spkg_list = NULL;
-static void *spkg_buf = NULL;
-static int spkg_size = 0;
-
-static void *ksceKernelAllocHeapMemoryPatched(SceUID uid, SceSize size) {
-  void *res = TAI_CONTINUE(void *, ksceKernelAllocHeapMemoryRef, uid, size);
-  if (size == sizeof(SceKernelPaddrList))
-    spkg_list = res;
-  return res;
-}
-
-static int ksceKernelFreeHeapMemoryPatched(SceUID uid, void *ptr) {
-  if (ptr == spkg_list) {
-    spkg_list = NULL;
-    spkg_buf = NULL;
-    spkg_size = 0;
-  }
-
-  return TAI_CONTINUE(int, ksceKernelFreeHeapMemoryRef, uid, ptr);
-}
-
-static int ksceSblSsInfraAllocatePARangeVectorPatched(void *buf, int size, SceUID blockid, SceKernelPaddrList *list) {
-  if (list == spkg_list) {
-    spkg_buf = buf;
-    spkg_size = size;
-  }
-
-  return TAI_CONTINUE(int, ksceSblSsInfraAllocatePARangeVectorRef, buf, size, blockid, list);
-}
-
-static int nzero32(uint32_t addr, int ctx) {
-  int ret = 0, sm_ret = 0;
-  memset(&cargs, 0, sizeof(cargs));
-  cargs.use_lv2_mode_0 = cargs.use_lv2_mode_1 = 0;
-  cargs.list_count = 3;
-  cargs.total_count = 1;
-  cargs.list.lv1[0].addr = cargs.list.lv1[1].addr = 0x50000000;
-  cargs.list.lv1[0].length = cargs.list.lv1[1].length = 0x10;
-  cargs.list.lv1[2].addr = 0;
-  cargs.list.lv1[2].length = addr - offsetof(heap_hdr_t, next);
-  ret = TAI_CONTINUE(int, ksceSblSmCommCallFuncRef, ctx, 0x50002, &sm_ret, &cargs, sizeof(cargs));
-  if (sm_ret < 0) {
-    return sm_ret;
-  }
-  return ret;
-}
-
 static int ksceSblSmCommCallFuncPatched(int id, int service_id, int *f00d_resp, void *data, int size) {
 	
-  if (doInject == 1 && service_id == 0xb0002)
-	   NZERO_RANGE(0x0080bb44, 0x0080bb98, id);
+  if (newFw) { // current > 3.71
+    if (service_id == SCE_SBL_SM_COMM_FID_SM_SNVS_ENCDEC_SECTORS && *(uint32_t*)data == 2) // enc/dec snvs, mode 2
+      lv0_nop32(0x0080bb8c, id); // remove fw check error
+    else if (skipSoftMin && service_id == SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG) { // target < 1.692
+      lv0_nop32(0x0080fea0, id); // remove 1.692 soft min fw checks
+      lv0_nop32(0x00810370, id);
+    }
+  } else if (!newFw && skipSoftMin && service_id == SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG) { // current < 3.72, target < 1.692
+    lv0_nop32(0x0080fe44, id); // remove 1.692 soft min fw checks
+    lv0_nop32(0x0080fe48, id);
+    lv0_nop32(0x00810298, id);
+    lv0_nop32(0x0081029C, id);
+  }
 	
   int res = TAI_CONTINUE(int, ksceSblSmCommCallFuncRef, id, service_id, f00d_resp, data, size);
 
-  if (f00d_resp && service_id == SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG) {
-    if (*f00d_resp == SCE_SBL_ERROR_SL_ESYSVER) {
-      // The spkg has actually been decrypted successfully, just fake success
-      *f00d_resp = 0;
-    } else if (*f00d_resp == SCE_SBL_ERROR_SL_EDATA) {
-      // Use custom spkg decryptor for < 1.692 spkg
-      if (spkg_list && spkg_buf && data && memcmp(data + 0x24, spkg_list, sizeof(SceKernelPaddrList)) == 0) {
-        *f00d_resp = decrypt_spkg(spkg_buf, spkg_size);
-        if (*f00d_resp >= 0) {
-          SceHeader *sce_header = (SceHeader *)spkg_buf;
-          SpkgHeader *spkg_header = (SpkgHeader *)(data + 0xf40);
-          memcpy(spkg_header, (char *)sce_header + sce_header->header_length, sizeof(SpkgHeader));
-          ksceKernelCpuDcacheAndL2WritebackRange(spkg_header, sizeof(SpkgHeader));
-        }
-      }
-    }
-  }
+  if (f00d_resp && service_id == SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG && *f00d_resp == 0x800F0237) // fw cmp error
+    *f00d_resp = 0; // The spkg has actually been decrypted successfully, just fake success
 
   return res;
 }
@@ -188,14 +93,8 @@ int k_modoru_release_updater_patches(void) {
   uint32_t state;
   ENTER_SYSCALL(state);
 
-  if (hooks[7] >= 0)
-    taiHookReleaseForKernel(hooks[7], ksceSblSmCommCallFuncRef);
-  if (hooks[6] >= 0)
-    taiHookReleaseForKernel(hooks[6], ksceKernelFreeHeapMemoryRef);
-  if (hooks[5] >= 0)
-    taiHookReleaseForKernel(hooks[5], ksceKernelAllocHeapMemoryRef);
   if (hooks[4] >= 0)
-    taiHookReleaseForKernel(hooks[4], ksceSblSsInfraAllocatePARangeVectorRef);
+    taiHookReleaseForKernel(hooks[4], ksceSblSmCommCallFuncRef);
   if (hooks[3] >= 0)
     taiHookReleaseForKernel(hooks[3], SceSysrootForDriver_55392965_ref);
   if (hooks[2] >= 0)
@@ -209,11 +108,14 @@ int k_modoru_release_updater_patches(void) {
   return 0;
 }
 
-int k_modoru_patch_updater(void) {
+int k_modoru_patch_updater(int setSkipSoftMin, int setNewFw) {
   int res;
   uint32_t state;
   ENTER_SYSCALL(state);
 
+  newFw = setNewFw;
+  skipSoftMin = setSkipSoftMin;
+  
   memset(hooks, -1, sizeof(hooks));
 
   res = hooks[0] = taiHookFunctionExportForKernel(KERNEL_PID, &ksceKernelStartPreloadedModulesRef, "SceKernelModulemgr",
@@ -246,22 +148,7 @@ int k_modoru_patch_updater(void) {
   if (res < 0)
     goto err;
 
-  res = hooks[4] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblSsInfraAllocatePARangeVectorRef, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0xE0B13BA7, ksceSblSsInfraAllocatePARangeVectorPatched);
-  if (res < 0)
-    goto err;
-
-  res = hooks[5] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceKernelAllocHeapMemoryRef, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0x7B4CB60A, ksceKernelAllocHeapMemoryPatched);
-  if (res < 0)
-    goto err;
-
-  res = hooks[6] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceKernelFreeHeapMemoryRef, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0x3EBCE343, ksceKernelFreeHeapMemoryPatched);
-  if (res < 0)
-    goto err;
-
-  res = hooks[7] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblSmCommCallFuncRef, "SceSblUpdateMgr",
+  res = hooks[4] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblSmCommCallFuncRef, "SceSblUpdateMgr",
                                                   TAI_ANY_LIBRARY, 0xDB9FC204, ksceSblSmCommCallFuncPatched);
   if (res < 0)
     goto err;
@@ -373,11 +260,8 @@ int k_modoru_get_factory_firmware(void) {
   unsigned int factory_fw = -1;
 
   void *sysroot = ksceKernelGetSysrootBuffer();
-  if (sysroot) {
+  if (sysroot)
     factory_fw = *(unsigned int *)(sysroot + 8);
-	if (*(unsigned int *)(sysroot + 4) > 0x03700011)
-		doInject = 1;
-  }
 
   EXIT_SYSCALL(state);
   return factory_fw;

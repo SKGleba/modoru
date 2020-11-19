@@ -264,7 +264,7 @@ int main(int argc, char *argv[]) {
   psvDebugScreenInit();
   sceKernelPowerLock(0);
 
-  printf("-- modoru v2.1\n");
+  printf("-- modoru v2.2\n");
   printf("   by TheFloW, mod by SKGleba\n\n");
 
   if (sceIoDevctl("ux0:", 0x3001, NULL, 0, NULL, 0) == 0x80010030)
@@ -424,11 +424,11 @@ int main(int argc, char *argv[]) {
 
   sceKernelPowerUnlock(0);
 
-  res = modoru_patch_updater();
+  res = modoru_patch_updater((target_version < 0x01692000), (current_version > 0x03700011));
   if (res < 0)
     ErrorExit(10000, "Error 0x%08X patching updater.\n", res);
 
-  res = modoru_launch_updater();
+  res = modoru_launch_updater((bypass) ? 0x30 : 0x10);
   if (res < 0)
     goto err;
 

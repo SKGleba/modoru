@@ -25,12 +25,13 @@ static tai_hook_ref_t sceIoRemoveRef;
 static tai_hook_ref_t vshSblAimgrIsCEXRef;
 
 static SceUID hooks[5];
+static int swu_mode = 0x10; // GUI with string "System Update"
 
 static char ux0_data_patch[] = "ux0:/data";
 
 static int sceSblUsGetUpdateModePatched(int *mode) {
   int res = TAI_CONTINUE(int, sceSblUsGetUpdateModeRef, mode);
-  *mode = 0x10; // GUI with string "System Update"
+  *mode = swu_mode;
   return res;
 }
 
@@ -132,11 +133,12 @@ int modoru_release_updater_patches(void) {
   return k_modoru_release_updater_patches();
 }
 
-int modoru_patch_updater(void) {
-  return k_modoru_patch_updater();
+int modoru_patch_updater(int setSkipSoftMin, int setNewFw) {
+  return k_modoru_patch_updater(setSkipSoftMin, setNewFw);
 }
 
-int modoru_launch_updater(void) {
+int modoru_launch_updater(int mode) {
+  swu_mode = mode;
   return k_modoru_launch_updater();
 }
 

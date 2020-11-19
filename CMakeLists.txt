@@ -59,7 +59,6 @@ vita_create_self(modoru_patch.skprx modoru_patch
 
 add_executable(modoru_kernel
   kernel.c
-  spkg.c
 )
 set_target_properties(modoru_kernel
   PROPERTIES LINK_FLAGS
