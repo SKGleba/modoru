@@ -21,20 +21,21 @@
 
 #define MOD_LIST_SIZE 128
 
-int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uint32_t funcnid, uintptr_t *func);
+int module_get_export_func(SceUID pid, const char* modname, uint32_t libnid, uint32_t funcnid, uintptr_t* func);
 
-int ksceAppMgrLaunchAppByPath(const char *name, const char *cmd, int cmdlen, int dynamic, void *opt, void *id);
+int ksceAppMgrLaunchAppByPath(const char* name, const char* cmd, int cmdlen, int dynamic, void* opt, void* id);
 
 static tai_hook_ref_t ksceKernelStartPreloadedModulesRef;
 static tai_hook_ref_t ksceSblACMgrIsDevelopmentModeRef;
 static tai_hook_ref_t SceSysrootForDriver_421EFC96_ref;
 static tai_hook_ref_t SceSysrootForDriver_55392965_ref;
 static tai_hook_ref_t ksceSblSmCommCallFuncRef;
+static tai_hook_ref_t sceSblSsUpdateMgrGetBootModeForUserRef;
 
 #include "lv0.h"
 
-static SceUID hooks[5];
-static int newFw = 0, skipSoftMin = 0;
+static SceUID hooks[6];
+static int newFw = 0, skipSoftMin = 0, swu_mode = 0xFF;
 
 static int ksceKernelStartPreloadedModulesPatched(SceUID pid) {
   int res = TAI_CONTINUE(int, ksceKernelStartPreloadedModulesRef, pid);
@@ -65,8 +66,8 @@ static int SceSysrootForDriver_55392965_patched(void) {
   return 1;
 }
 
-static int ksceSblSmCommCallFuncPatched(int id, int service_id, int *f00d_resp, void *data, int size) {
-	
+static int ksceSblSmCommCallFuncPatched(int id, int service_id, int* f00d_resp, void* data, int size) {
+
   if (newFw) { // current > 3.71
     if (service_id == SCE_SBL_SM_COMM_FID_SM_SNVS_ENCDEC_SECTORS && *(uint32_t*)data == 2) // enc/dec snvs, mode 2
       lv0_nop32(0x0080bb8c, id); // remove fw check error
@@ -80,7 +81,7 @@ static int ksceSblSmCommCallFuncPatched(int id, int service_id, int *f00d_resp, 
     lv0_nop32(0x00810298, id);
     lv0_nop32(0x0081029C, id);
   }
-	
+
   int res = TAI_CONTINUE(int, ksceSblSmCommCallFuncRef, id, service_id, f00d_resp, data, size);
 
   if (f00d_resp && service_id == SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG && *f00d_resp == 0x800F0237) // fw cmp error
@@ -89,10 +90,20 @@ static int ksceSblSmCommCallFuncPatched(int id, int service_id, int *f00d_resp, 
   return res;
 }
 
+static int sceSblSsUpdateMgrGetBootModeForUserPatched(uintptr_t ubuf) {
+  uint32_t state;
+  ENTER_SYSCALL(state);
+  ksceKernelMemcpyKernelToUser(ubuf, &swu_mode, 1);
+  EXIT_SYSCALL(state);
+  return 0;
+}
+
 int k_modoru_release_updater_patches(void) {
   uint32_t state;
   ENTER_SYSCALL(state);
 
+  if (hooks[5] >= 0)
+    taiHookReleaseForKernel(hooks[5], sceSblSsUpdateMgrGetBootModeForUserRef);
   if (hooks[4] >= 0)
     taiHookReleaseForKernel(hooks[4], ksceSblSmCommCallFuncRef);
   if (hooks[3] >= 0)
@@ -115,41 +126,46 @@ int k_modoru_patch_updater(int setSkipSoftMin, int setNewFw) {
 
   newFw = setNewFw;
   skipSoftMin = setSkipSoftMin;
-  
+
   memset(hooks, -1, sizeof(hooks));
 
   res = hooks[0] = taiHookFunctionExportForKernel(KERNEL_PID, &ksceKernelStartPreloadedModulesRef, "SceKernelModulemgr",
-                                                  TAI_ANY_LIBRARY, 0x432DCC7A, ksceKernelStartPreloadedModulesPatched);
+    TAI_ANY_LIBRARY, 0x432DCC7A, ksceKernelStartPreloadedModulesPatched);
   if (res < 0) {
     res = hooks[0] = taiHookFunctionExportForKernel(KERNEL_PID, &ksceKernelStartPreloadedModulesRef, "SceKernelModulemgr",
-                                                    TAI_ANY_LIBRARY, 0x998C7AE9, ksceKernelStartPreloadedModulesPatched);
+      TAI_ANY_LIBRARY, 0x998C7AE9, ksceKernelStartPreloadedModulesPatched);
   }
 
   if (res < 0)
     goto err;
 
   res = hooks[1] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblACMgrIsDevelopmentModeRef, "SceAppMgr",
-                                                  TAI_ANY_LIBRARY, 0xBBA13D9C, ksceSblACMgrIsDevelopmentModePatched);
+    TAI_ANY_LIBRARY, 0xBBA13D9C, ksceSblACMgrIsDevelopmentModePatched);
   if (res < 0) {
     res = hooks[1] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblACMgrIsDevelopmentModeRef, "SceAppMgr",
-                                                    TAI_ANY_LIBRARY, 0xE87D1777, ksceSblACMgrIsDevelopmentModePatched);
+      TAI_ANY_LIBRARY, 0xE87D1777, ksceSblACMgrIsDevelopmentModePatched);
   }
 
   if (res < 0)
     goto err;
 
   res = hooks[2] = taiHookFunctionImportForKernel(KERNEL_PID, &SceSysrootForDriver_421EFC96_ref, "SceAppMgr",
-                                                  TAI_ANY_LIBRARY, 0x421EFC96, SceSysrootForDriver_421EFC96_patched);
+    TAI_ANY_LIBRARY, 0x421EFC96, SceSysrootForDriver_421EFC96_patched);
   if (res < 0)
     goto err;
 
   res = hooks[3] = taiHookFunctionImportForKernel(KERNEL_PID, &SceSysrootForDriver_55392965_ref, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0x55392965, SceSysrootForDriver_55392965_patched);
+    TAI_ANY_LIBRARY, 0x55392965, SceSysrootForDriver_55392965_patched);
   if (res < 0)
     goto err;
 
   res = hooks[4] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblSmCommCallFuncRef, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0xDB9FC204, ksceSblSmCommCallFuncPatched);
+    TAI_ANY_LIBRARY, 0xDB9FC204, ksceSblSmCommCallFuncPatched);
+  if (res < 0)
+    goto err;
+
+  res = hooks[5] = taiHookFunctionExportForKernel(KERNEL_PID, &sceSblSsUpdateMgrGetBootModeForUserRef, "SceSblUpdateMgr",
+    TAI_ANY_LIBRARY, 0x8E834565, sceSblSsUpdateMgrGetBootModeForUserPatched);
   if (res < 0)
     goto err;
 
@@ -162,8 +178,8 @@ err:
   return res;
 }
 
-static int launch_thread(SceSize args, void *argp) {
-  int opt[52/4];
+static int launch_thread(SceSize args, void* argp) {
+  int opt[52 / 4];
   memset(opt, 0, sizeof(opt));
   opt[0] = sizeof(opt);
 
@@ -172,10 +188,12 @@ static int launch_thread(SceSize args, void *argp) {
   return ksceKernelExitDeleteThread(0);
 }
 
-int k_modoru_launch_updater(void) {
+int k_modoru_launch_updater(int mode) {
   uint32_t state;
   ENTER_SYSCALL(state);
-
+  
+  swu_mode = mode;
+  
   SceUID thid = ksceKernelCreateThread("launch_thread", (SceKernelThreadEntry)launch_thread, 0x40, 0x1000, 0, 0, NULL);
   if (thid < 0) {
     EXIT_SYSCALL(state);
@@ -197,22 +215,22 @@ int k_modoru_detect_plugins(void) {
   uint32_t state;
   ENTER_SYSCALL(state);
 
-  int (* _ksceKernelGetModuleList)(SceUID pid, int flags1, int flags2, SceUID *modids, size_t *num);
-  int (* _ksceKernelGetModuleInfo)(SceUID pid, SceUID modid, SceKernelModuleInfo *info);
+  int (*_ksceKernelGetModuleList)(SceUID pid, int flags1, int flags2, SceUID * modids, size_t * num);
+  int (*_ksceKernelGetModuleInfo)(SceUID pid, SceUID modid, SceKernelModuleInfo * info);
 
   res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                               0x97CF7B4E, (uintptr_t *)&_ksceKernelGetModuleList);
+    0x97CF7B4E, (uintptr_t*)&_ksceKernelGetModuleList);
   if (res < 0)
     res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                                 0xB72C75A4, (uintptr_t *)&_ksceKernelGetModuleList);
+      0xB72C75A4, (uintptr_t*)&_ksceKernelGetModuleList);
   if (res < 0)
     goto err;
 
   res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                               0xD269F915, (uintptr_t *)&_ksceKernelGetModuleInfo);
+    0xD269F915, (uintptr_t*)&_ksceKernelGetModuleInfo);
   if (res < 0)
     res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                                 0xDAA90093, (uintptr_t *)&_ksceKernelGetModuleInfo);
+      0xDAA90093, (uintptr_t*)&_ksceKernelGetModuleInfo);
   if (res < 0)
     goto err;
 
@@ -259,15 +277,15 @@ int k_modoru_get_factory_firmware(void) {
 
   unsigned int factory_fw = -1;
 
-  void *sysroot = ksceKernelGetSysrootBuffer();
+  void* sysroot = ksceKernelGetSysrootBuffer();
   if (sysroot)
-    factory_fw = *(unsigned int *)(sysroot + 8);
+    factory_fw = *(unsigned int*)(sysroot + 8);
 
   EXIT_SYSCALL(state);
   return factory_fw;
 }
 
-int k_modoru_ctrl_peek_buffer_positive(int port, SceCtrlData *pad_data, int count) {
+int k_modoru_ctrl_peek_buffer_positive(int port, SceCtrlData* pad_data, int count) {
   SceCtrlData pad;
   uint32_t off;
 
@@ -289,12 +307,12 @@ int k_modoru_ctrl_peek_buffer_positive(int port, SceCtrlData *pad_data, int coun
   return res;
 }
 
-void _start() __attribute__ ((weak, alias ("module_start")));
-int module_start(SceSize args, void *argp) {
+void _start() __attribute__((weak, alias("module_start")));
+int module_start(SceSize args, void* argp) {
   return SCE_KERNEL_START_SUCCESS;
 }
 
-int module_stop(SceSize args, void *argp) {
+int module_stop(SceSize args, void* argp) {
   k_modoru_release_updater_patches();
   return SCE_KERNEL_STOP_SUCCESS;
 }

@@ -299,9 +299,8 @@ int main(int argc, char *argv[]) {
 
   SceCtrlData pad;
   modoru_ctrl_peek_buffer_positive(0, &pad, 1);
-  if (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_R1)) {
+  if (pad.buttons & SCE_CTRL_RTRIGGER)
     bypass = 1;
-  }
 
   if (!bypass) {
     if (scePowerGetBatteryLifePercent() < 50)
@@ -428,7 +427,7 @@ int main(int argc, char *argv[]) {
   if (res < 0)
     ErrorExit(10000, "Error 0x%08X patching updater.\n", res);
 
-  res = modoru_launch_updater((bypass) ? 0x30 : 0x10);
+  res = modoru_launch_updater((bypass) ? 0x30 : 0x10); // CUI or GUI
   if (res < 0)
     goto err;
 

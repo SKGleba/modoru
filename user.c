@@ -19,20 +19,17 @@
 
 #include "modoru.h"
 
-static tai_hook_ref_t sceSblUsGetUpdateModeRef;
+static tai_hook_ref_t sceSblUsSetUpdateModeRef;
 static tai_hook_ref_t sceSblUsPowerControlRef;
 static tai_hook_ref_t sceIoRemoveRef;
 static tai_hook_ref_t vshSblAimgrIsCEXRef;
 
 static SceUID hooks[5];
-static int swu_mode = 0x10; // GUI with string "System Update"
 
 static char ux0_data_patch[] = "ux0:/data";
 
-static int sceSblUsGetUpdateModePatched(int *mode) {
-  int res = TAI_CONTINUE(int, sceSblUsGetUpdateModeRef, mode);
-  *mode = swu_mode;
-  return res;
+static int sceSblUsSetUpdateModePatched(int mode) {
+  return 0; // Don't change the flag
 }
 
 static int sceSblUsPowerControlPatched(int cmd, int arg) {
@@ -44,7 +41,7 @@ static int sceSblUsPowerControlPatched(int cmd, int arg) {
   return TAI_CONTINUE(int, sceSblUsPowerControlRef, cmd, arg);
 }
 
-static int sceIoRemovePatched(const char *file) {
+static int sceIoRemovePatched(const char* file) {
   TAI_CONTINUE(int, sceIoRemoveRef, file);
   return 0;
 }
@@ -64,7 +61,7 @@ int modoru_release_psp2swu_patches(void) {
   if (hooks[1] >= 0)
     taiHookRelease(hooks[1], sceSblUsPowerControlRef);
   if (hooks[0] >= 0)
-    taiHookRelease(hooks[0], sceSblUsGetUpdateModeRef);
+    taiHookRelease(hooks[0], sceSblUsSetUpdateModeRef);
 
   return 0;
 }
@@ -91,29 +88,29 @@ int modoru_patch_psp2swu(void) {
 
   sceClibMemset(hooks, -1, sizeof(hooks));
 
-  res = hooks[0] = taiHookFunctionImport(&sceSblUsGetUpdateModeRef, "ScePsp2Swu",
-                                         TAI_ANY_LIBRARY, 0x8E834565, sceSblUsGetUpdateModePatched);
+  res = hooks[0] = taiHookFunctionImport(&sceSblUsSetUpdateModeRef, "ScePsp2Swu",
+    TAI_ANY_LIBRARY, 0xC725E3F0, sceSblUsSetUpdateModePatched);
   if (res < 0)
     goto err;
 
   res = hooks[1] = taiHookFunctionImport(&sceSblUsPowerControlRef, "ScePsp2Swu",
-                                         TAI_ANY_LIBRARY, 0x1825D954, sceSblUsPowerControlPatched);
+    TAI_ANY_LIBRARY, 0x1825D954, sceSblUsPowerControlPatched);
   if (res < 0)
     goto err;
 
   res = hooks[2] = taiHookFunctionImport(&sceIoRemoveRef, "ScePsp2Swu",
-                                         TAI_ANY_LIBRARY, 0xE20ED0F3, sceIoRemovePatched);
+    TAI_ANY_LIBRARY, 0xE20ED0F3, sceIoRemovePatched);
   if (res < 0)
     goto err;
 
   res = hooks[3] = taiHookFunctionImport(&vshSblAimgrIsCEXRef, "ScePsp2Swu",
-                                         TAI_ANY_LIBRARY, 0x27216A82, vshSblAimgrIsCEXPatched);
+    TAI_ANY_LIBRARY, 0x27216A82, vshSblAimgrIsCEXPatched);
   if (res < 0)
     goto err;
 
   int i;
   for (i = 0; i < (uint32_t)mod_info.segments[0].memsz; i += 4) {
-    if (sceClibStrncmp((char *)(mod_info.segments[0].vaddr + i), "ud0:/PSP2UPDATE", 16) == 0) {
+    if (sceClibStrncmp((char*)(mod_info.segments[0].vaddr + i), "ud0:/PSP2UPDATE", 16) == 0) {
       res = hooks[4] = taiInjectData(tai_info.modid, 0, i, ux0_data_patch, sizeof(ux0_data_patch));
       if (res < 0)
         goto err;
@@ -138,8 +135,7 @@ int modoru_patch_updater(int setSkipSoftMin, int setNewFw) {
 }
 
 int modoru_launch_updater(int mode) {
-  swu_mode = mode;
-  return k_modoru_launch_updater();
+  return k_modoru_launch_updater(mode);
 }
 
 int modoru_detect_plugins(void) {
@@ -150,17 +146,17 @@ int modoru_get_factory_firmware(void) {
   return k_modoru_get_factory_firmware();
 }
 
-int modoru_ctrl_peek_buffer_positive(int port, SceCtrlData *pad_data, int count) {
+int modoru_ctrl_peek_buffer_positive(int port, SceCtrlData* pad_data, int count) {
   return k_modoru_ctrl_peek_buffer_positive(port, pad_data, count);
 }
 
-void _start() __attribute__ ((weak, alias("module_start")));
-int module_start(SceSize args, void *argp) {
+void _start() __attribute__((weak, alias("module_start")));
+int module_start(SceSize args, void* argp) {
   modoru_patch_psp2swu();
   return SCE_KERNEL_START_SUCCESS;
 }
 
-int module_stop(SceSize args, void *argp) {
+int module_stop(SceSize args, void* argp) {
   modoru_release_psp2swu_patches();
   return SCE_KERNEL_STOP_SUCCESS;
 }

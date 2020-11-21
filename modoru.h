@@ -5,7 +5,7 @@
 
 int k_modoru_release_updater_patches(void);
 int k_modoru_patch_updater(int setSkipSoftMin, int setNewFw);
-int k_modoru_launch_updater(void);
+int k_modoru_launch_updater(int mode);
 int k_modoru_detect_plugins(void);
 int k_modoru_get_factory_firmware(void);
 int k_modoru_ctrl_peek_buffer_positive(int port, SceCtrlData *pad_data, int count);
