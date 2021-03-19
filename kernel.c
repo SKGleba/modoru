@@ -17,11 +17,14 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "spkg.h"
-
-#define APP_PATH "ux0:app/MODORU000/"
-
-#define MOD_LIST_SIZE 128
+#define ENSONX_CRC_OLD 0xDD3C459B
+#define ENSONX_CRC_NEW 0x52CBF098
+#define SL_CRC_OLD 0x3D2B73D7
+#define SL_CRC_NEW 0xDB02B893
+#define SCE_SBL_ERROR_SL_EDATA   0x800F0226
+#define SCE_SBL_ERROR_SL_ESYSVER 0x800F0237
+#define SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG 0x40002
+#define ARRAYSIZE(x) ((sizeof(x) / sizeof(0 [x])) / ((size_t)(!(sizeof(x) % sizeof(0 [x])))))
 
 #define NZERO_RANGE(off, end, ctx) \
 	do { \
@@ -31,6 +34,27 @@
 			curr = curr + 4; \
 		} \
 } while (0)
+
+typedef struct {
+  uint32_t off;
+  uint32_t sz;
+  uint8_t code;
+  uint8_t type;
+  uint8_t active;
+  uint32_t flags;
+  uint16_t unk;
+} __attribute__((packed)) partition_t;
+
+typedef struct {
+  char magic[0x20];
+  uint32_t version;
+  uint32_t device_size;
+  char unk1[0x28];
+  partition_t partitions[0x10];
+  char unk2[0x5e];
+  char unk3[0x10 * 4];
+  uint16_t sig;
+} __attribute__((packed)) master_block_t;
 
 typedef struct {
   void *addr;
@@ -61,6 +85,8 @@ typedef struct heap_hdr {
   struct heap_hdr *next;
 } __attribute__((packed)) heap_hdr_t;
 
+#include "crc32.c"
+
 cmd_0x50002_t cargs;
 
 int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uint32_t funcnid, uintptr_t *func);
@@ -71,24 +97,23 @@ static tai_hook_ref_t ksceKernelStartPreloadedModulesRef;
 static tai_hook_ref_t ksceSblACMgrIsDevelopmentModeRef;
 static tai_hook_ref_t SceSysrootForDriver_421EFC96_ref;
 static tai_hook_ref_t SceSysrootForDriver_55392965_ref;
-static tai_hook_ref_t ksceSblSsInfraAllocatePARangeVectorRef;
-static tai_hook_ref_t ksceKernelAllocHeapMemoryRef;
-static tai_hook_ref_t ksceKernelFreeHeapMemoryRef;
 static tai_hook_ref_t ksceSblSmCommCallFuncRef;
+static tai_hook_ref_t sceSblSsUpdateMgrSendCommandRef;
 
-static SceUID hooks[8];
-
-static int doInject = 0;
+static SceUID hooks[5];
+void* eobuf = NULL;
+static int doInject = 0, resetHooked = 0, emmc = 0;
+static int (*read_real_mmc)(int target, uint32_t off, void* dst, uint32_t sz) = NULL;
 
 static int ksceKernelStartPreloadedModulesPatched(SceUID pid) {
   int res = TAI_CONTINUE(int, ksceKernelStartPreloadedModulesRef, pid);
 
   char titleid[32];
-  ksceKernelGetProcessTitleId(pid, titleid, sizeof(titleid));
+  ksceKernelSysrootGetProcessTitleId(pid, titleid, sizeof(titleid));
 
   if (strcmp(titleid, "NPXS10999") == 0) {
     ksceKernelLoadStartModuleForPid(pid, "vs0:sys/external/libshellsvc.suprx", 0, NULL, 0, NULL, NULL);
-    ksceKernelLoadStartModuleForPid(pid, APP_PATH "modoru_user.suprx", 0, NULL, 0, NULL, NULL);
+    ksceKernelLoadStartModuleForPid(pid, "ud0:tiny_modoru_user.suprx", 0, NULL, 0, NULL, NULL);
   }
 
   return res;
@@ -107,36 +132,6 @@ static int SceSysrootForDriver_421EFC96_patched(void) {
 static int SceSysrootForDriver_55392965_patched(void) {
   TAI_CONTINUE(int, SceSysrootForDriver_55392965_ref);
   return 1;
-}
-
-static void *spkg_list = NULL;
-static void *spkg_buf = NULL;
-static int spkg_size = 0;
-
-static void *ksceKernelAllocHeapMemoryPatched(SceUID uid, SceSize size) {
-  void *res = TAI_CONTINUE(void *, ksceKernelAllocHeapMemoryRef, uid, size);
-  if (size == sizeof(SceKernelPaddrList))
-    spkg_list = res;
-  return res;
-}
-
-static int ksceKernelFreeHeapMemoryPatched(SceUID uid, void *ptr) {
-  if (ptr == spkg_list) {
-    spkg_list = NULL;
-    spkg_buf = NULL;
-    spkg_size = 0;
-  }
-
-  return TAI_CONTINUE(int, ksceKernelFreeHeapMemoryRef, uid, ptr);
-}
-
-static int ksceSblSsInfraAllocatePARangeVectorPatched(void *buf, int size, SceUID blockid, SceKernelPaddrList *list) {
-  if (list == spkg_list) {
-    spkg_buf = buf;
-    spkg_size = size;
-  }
-
-  return TAI_CONTINUE(int, ksceSblSsInfraAllocatePARangeVectorRef, buf, size, blockid, list);
 }
 
 static int nzero32(uint32_t addr, int ctx) {
@@ -163,39 +158,106 @@ static int ksceSblSmCommCallFuncPatched(int id, int service_id, int *f00d_resp, 
 	
   int res = TAI_CONTINUE(int, ksceSblSmCommCallFuncRef, id, service_id, f00d_resp, data, size);
 
-  if (f00d_resp && service_id == SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG) {
-    if (*f00d_resp == SCE_SBL_ERROR_SL_ESYSVER) {
-      // The spkg has actually been decrypted successfully, just fake success
-      *f00d_resp = 0;
-    } else if (*f00d_resp == SCE_SBL_ERROR_SL_EDATA) {
-      // Use custom spkg decryptor for < 1.692 spkg
-      if (spkg_list && spkg_buf && data && memcmp(data + 0x24, spkg_list, sizeof(SceKernelPaddrList)) == 0) {
-        *f00d_resp = decrypt_spkg(spkg_buf, spkg_size);
-        if (*f00d_resp >= 0) {
-          SceHeader *sce_header = (SceHeader *)spkg_buf;
-          SpkgHeader *spkg_header = (SpkgHeader *)(data + 0xf40);
-          memcpy(spkg_header, (char *)sce_header + sce_header->header_length, sizeof(SpkgHeader));
-          ksceKernelCpuDcacheAndL2WritebackRange(spkg_header, sizeof(SpkgHeader));
-        }
-      }
-    }
-  }
+  if (f00d_resp && service_id == SCE_SBL_SM_COMM_FID_SM_AUTH_SPKG && *f00d_resp == SCE_SBL_ERROR_SL_ESYSVER)
+    *f00d_resp = 0;
 
   return res;
+}
+
+// find partition [part_id] with active flag set to [active] in sce mbr [master]
+int find_part(master_block_t* master, uint8_t part_id, uint8_t active) {
+  for (size_t i = 0; i < ARRAYSIZE(master->partitions); ++i) {
+    if (master->partitions[i].code == part_id && master->partitions[i].active == active)
+      return i;
+  }
+  return -1;
+}
+
+int sceSblSsUpdateMgrSendCommandPatched(int cmd, int arg) {
+  if ((uint32_t)cmd > 1 || emmc == 0 || read_real_mmc == NULL)
+    return TAI_CONTINUE(int, sceSblSsUpdateMgrSendCommandRef, cmd, arg);
+  
+  uint32_t state = 0;
+  ENTER_SYSCALL(state);
+  
+  ksceDebugPrintf("send command coldreset/standby\n");
+  
+  // alloc a 2MB memblock in camera SRAM
+  ksceDebugPrintf("alloc memblock...\n");
+  SceKernelAllocMemBlockKernelOpt optp;
+  optp.size = 0x58;
+  optp.attr = 2;
+  optp.paddr = 0x1c000000;
+  void* eobuf = NULL;
+  ksceKernelGetMemBlockBase(ksceKernelAllocMemBlock("sram_cam", 0x60208006, 0x200000, &optp), (void**)&eobuf);
+  if (eobuf == NULL)
+    goto err;
+  
+  // get expected second_loader crc32
+  ksceDebugPrintf("get exp crc...\n");
+  uint32_t exp_crc = 0;
+  uint32_t eobuf_crc = crc32(0, eobuf, 0x2E * 0x200);
+  if (eobuf_crc == ENSONX_CRC_OLD)
+    exp_crc = SL_CRC_OLD;
+  else if (eobuf_crc == ENSONX_CRC_NEW)
+    exp_crc = SL_CRC_NEW;
+  ksceDebugPrintf("enso 0x%X => SL 0x%X\n", eobuf_crc, exp_crc);
+  if (exp_crc == 0)
+    goto err;
+  
+  // read the current real MBR
+  ksceDebugPrintf("reading the MBR...\n");
+  char block[0x200];
+  master_block_t* mbr = (master_block_t * )block;
+  if (read_real_mmc(emmc, 0, mbr, 1) < 0)
+    goto err;
+  
+  // check if second_loader block 0 (fw string) crc32 matches the expected one
+  // TODO: crc arm kbl instead to future-proof from the CLever exploit
+  ksceDebugPrintf("read SL str...");
+  char slstr[0x200];
+  int pno_slsk = find_part(mbr, 2, 1);
+  if (pno_slsk < 0 || read_real_mmc(emmc, 1 + mbr->partitions[pno_slsk].off, slstr, 1) < 0)
+    goto err;
+  ksceDebugPrintf("cmp SL str crc...\n");
+  if (crc32(0, slstr + 0x40, 0x10) != exp_crc)
+    goto err;
+  
+  // writeback the MBR to block 0 and block 1
+  ksceDebugPrintf("cleaning the BR...\n");
+  if (ksceSdifWriteSectorMmc(emmc, 0, mbr, 1) < 0 || ksceSdifWriteSectorMmc(emmc, 1, mbr, 1) < 0)
+    goto err;
+  
+  // write enso to sector 2+
+  ksceDebugPrintf("writing enso...\n");
+  if (ksceSdifWriteSectorMmc(emmc, 2, eobuf, 0x2E) < 0)
+    goto err;
+  
+  // update the MBR with enso exploit offset
+  ksceDebugPrintf("installing enso...\n");
+  int pno_os = find_part(mbr, 3, 1);
+  if (pno_os < 0)
+    goto err;
+  mbr->partitions[pno_os].off = 2;
+  if (ksceSdifWriteSectorMmc(emmc, 0, mbr, 1) < 0)
+    goto err;
+  
+  ksceDebugPrintf("all done\n");
+  
+
+err:
+  EXIT_SYSCALL(state);
+  return TAI_CONTINUE(int, sceSblSsUpdateMgrSendCommandRef, cmd, arg);
 }
 
 int k_modoru_release_updater_patches(void) {
   uint32_t state;
   ENTER_SYSCALL(state);
 
-  if (hooks[7] >= 0)
-    taiHookReleaseForKernel(hooks[7], ksceSblSmCommCallFuncRef);
-  if (hooks[6] >= 0)
-    taiHookReleaseForKernel(hooks[6], ksceKernelFreeHeapMemoryRef);
-  if (hooks[5] >= 0)
-    taiHookReleaseForKernel(hooks[5], ksceKernelAllocHeapMemoryRef);
+  if (resetHooked > 0)
+    taiHookReleaseForKernel(resetHooked, sceSblSsUpdateMgrSendCommandRef);
   if (hooks[4] >= 0)
-    taiHookReleaseForKernel(hooks[4], ksceSblSsInfraAllocatePARangeVectorRef);
+    taiHookReleaseForKernel(hooks[4], ksceSblSmCommCallFuncRef);
   if (hooks[3] >= 0)
     taiHookReleaseForKernel(hooks[3], SceSysrootForDriver_55392965_ref);
   if (hooks[2] >= 0)
@@ -246,22 +308,7 @@ int k_modoru_patch_updater(void) {
   if (res < 0)
     goto err;
 
-  res = hooks[4] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblSsInfraAllocatePARangeVectorRef, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0xE0B13BA7, ksceSblSsInfraAllocatePARangeVectorPatched);
-  if (res < 0)
-    goto err;
-
-  res = hooks[5] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceKernelAllocHeapMemoryRef, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0x7B4CB60A, ksceKernelAllocHeapMemoryPatched);
-  if (res < 0)
-    goto err;
-
-  res = hooks[6] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceKernelFreeHeapMemoryRef, "SceSblUpdateMgr",
-                                                  TAI_ANY_LIBRARY, 0x3EBCE343, ksceKernelFreeHeapMemoryPatched);
-  if (res < 0)
-    goto err;
-
-  res = hooks[7] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblSmCommCallFuncRef, "SceSblUpdateMgr",
+  res = hooks[4] = taiHookFunctionImportForKernel(KERNEL_PID, &ksceSblSmCommCallFuncRef, "SceSblUpdateMgr",
                                                   TAI_ANY_LIBRARY, 0xDB9FC204, ksceSblSmCommCallFuncPatched);
   if (res < 0)
     goto err;
@@ -301,78 +348,13 @@ int k_modoru_launch_updater(void) {
   return 0;
 }
 
-int k_modoru_detect_plugins(void) {
-  SceKernelModuleInfo info;
-  SceUID modlist[MOD_LIST_SIZE];
-  size_t count = MOD_LIST_SIZE;
-  int res;
-
-  uint32_t state;
-  ENTER_SYSCALL(state);
-
-  int (* _ksceKernelGetModuleList)(SceUID pid, int flags1, int flags2, SceUID *modids, size_t *num);
-  int (* _ksceKernelGetModuleInfo)(SceUID pid, SceUID modid, SceKernelModuleInfo *info);
-
-  res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                               0x97CF7B4E, (uintptr_t *)&_ksceKernelGetModuleList);
-  if (res < 0)
-    res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                                 0xB72C75A4, (uintptr_t *)&_ksceKernelGetModuleList);
-  if (res < 0)
-    goto err;
-
-  res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                               0xD269F915, (uintptr_t *)&_ksceKernelGetModuleInfo);
-  if (res < 0)
-    res = module_get_export_func(KERNEL_PID, "SceKernelModulemgr", TAI_ANY_LIBRARY,
-                                 0xDAA90093, (uintptr_t *)&_ksceKernelGetModuleInfo);
-  if (res < 0)
-    goto err;
-
-  res = _ksceKernelGetModuleList(KERNEL_PID, 0x7fffffff, 1, modlist, &count);
-  if (res < 0)
-    goto err;
-
-  info.size = sizeof(SceKernelModuleInfo);
-  res = _ksceKernelGetModuleInfo(KERNEL_PID, modlist[2], &info);
-  if (res < 0)
-    goto err;
-
-  // Third last kernel module must be either taihen or HENkaku
-  if (strcmp(info.module_name, "taihen") != 0 && strcmp(info.module_name, "HENkaku") != 0) {
-    res = 1;
-    goto err;
-  }
-
-  res = _ksceKernelGetModuleList(ksceKernelGetProcessId(), 0x7fffffff, 1, modlist, &count);
-  if (res < 0)
-    goto err;
-
-  info.size = sizeof(SceKernelModuleInfo);
-  res = _ksceKernelGetModuleInfo(ksceKernelGetProcessId(), modlist[1], &info);
-  if (res < 0)
-    goto err;
-
-  // Second last user module must be SceAppUtil
-  if (strcmp(info.module_name, "SceAppUtil") != 0) {
-    res = 1;
-    goto err;
-  }
-
-  res = 0;
-
-err:
-  EXIT_SYSCALL(state);
-  return res;
-}
-
 int k_modoru_get_factory_firmware(void) {
   uint32_t state;
   ENTER_SYSCALL(state);
 
   unsigned int factory_fw = -1;
 
-  void *sysroot = ksceKernelGetSysrootBuffer();
+  void* sysroot = ksceKernelSysrootGetKblParam();
   if (sysroot) {
     factory_fw = *(unsigned int *)(sysroot + 8);
 	if (*(unsigned int *)(sysroot + 4) > 0x03700011)
@@ -405,8 +387,41 @@ int k_modoru_ctrl_peek_buffer_positive(int port, SceCtrlData *pad_data, int coun
   return res;
 }
 
+int k_modoru_add_enso(void *u_eobuf) {
+  if (emmc == 0 || read_real_mmc == NULL)
+    return -1;
+  uint32_t state;
+  ENTER_SYSCALL(state);
+  SceKernelAllocMemBlockKernelOpt optp;
+  optp.size = 0x58;
+  optp.attr = 2;
+  optp.paddr = 0x1c000000;
+  int add_eo_blk = ksceKernelAllocMemBlock("add_enso_block", 0x60208006, 0x200000, &optp);
+  if (add_eo_blk < 0)
+    goto aerr;
+  void* add_eo_base = NULL;
+  ksceKernelGetMemBlockBase(add_eo_blk, (void**)&add_eo_base);
+  memset(add_eo_base, 0, 0x30 * 0x200);
+  ksceKernelMemcpyUserToKernel(add_eo_base, (uintptr_t)u_eobuf, 0x2E * 0x200);
+  uint32_t add_eo_crc = crc32(0, add_eo_base, 0x2E * 0x200);
+  ksceKernelFreeMemBlock(add_eo_blk);
+  ksceDebugPrintf("add_eo_crc: 0x%X\n", add_eo_crc);
+  if (add_eo_crc != ENSONX_CRC_OLD && add_eo_crc != ENSONX_CRC_NEW)
+    goto aerr;
+  resetHooked = taiHookFunctionExportForKernel(KERNEL_PID, &sceSblSsUpdateMgrSendCommandRef, "SceSblUpdateMgr", 0x31406C49, 0x1825D954, sceSblSsUpdateMgrSendCommandPatched);
+  if (resetHooked < 0)
+    goto aerr;
+  EXIT_SYSCALL(state);
+  return 0;
+aerr:
+  EXIT_SYSCALL(state);
+  return -1;
+}
+
 void _start() __attribute__ ((weak, alias ("module_start")));
 int module_start(SceSize args, void *argp) {
+  emmc = ksceSdifGetSdContextPartValidateMmc(0);
+  module_get_offset(KERNEL_PID, ksceKernelSearchModuleByName("SceSdif"), 0, 0x3e7d, (uintptr_t*)&read_real_mmc);
   return SCE_KERNEL_START_SUCCESS;
 }
 

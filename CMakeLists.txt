@@ -19,7 +19,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
 
 link_directories(
   ${CMAKE_BINARY_DIR}/modoru_kernel_stubs
-  ${CMAKE_BINARY_DIR}/modoru_user_stubs
 )
 
 add_executable(modoru
@@ -28,7 +27,7 @@ add_executable(modoru
   font.c
 )
 
-add_dependencies(modoru modoru_kernel.skprx)
+add_dependencies(modoru tiny_modoru.skprx)
 
 target_link_libraries(modoru
   SceAppMgr_stub
@@ -37,29 +36,13 @@ target_link_libraries(modoru
   ScePower_stub
   SceVshBridge_stub
   taihen_stub
-  modoru_user_stub_weak
+  modoru_kernel_stub
 )
 
-vita_create_self(eboot.bin modoru UNSAFE)
-
-add_executable(modoru_patch
-  patch.c
-)
-set_target_properties(modoru_patch
-  PROPERTIES LINK_FLAGS
-  -nostdlib
-)
-target_link_libraries(modoru_patch
-  taihenForKernel_stub
-)
-vita_create_self(modoru_patch.skprx modoru_patch
-  CONFIG ${CMAKE_SOURCE_DIR}/patch_exports.yml
-  UNSAFE
-)
+vita_create_self(tny_modoru.self modoru UNSAFE)
 
 add_executable(modoru_kernel
   kernel.c
-  spkg.c
 )
 set_target_properties(modoru_kernel
   PROPERTIES LINK_FLAGS
@@ -78,8 +61,10 @@ target_link_libraries(modoru_kernel
   SceThreadmgrForDriver_stub
   taihenForKernel_stub
   taihenModuleUtils_stub
+  SceSdifForDriver_stub
+  SceDebugForDriver_stub
 )
-vita_create_self(modoru_kernel.skprx modoru_kernel
+vita_create_self(tiny_modoru.skprx modoru_kernel
   CONFIG ${CMAKE_SOURCE_DIR}/kernel_exports.yml
   UNSAFE
 )
@@ -97,28 +82,12 @@ target_link_libraries(modoru_user
   SceShellSvc_stub
   ScePower_stub
   taihen_stub
-  modoru_kernel_stub
 )
-vita_create_self(modoru_user.suprx modoru_user
+vita_create_self(tiny_modoru.suprx modoru_user
   CONFIG ${CMAKE_SOURCE_DIR}/user_exports.yml
   UNSAFE
 )
-vita_create_stubs(modoru_user_stubs modoru_user ${CMAKE_SOURCE_DIR}/user_exports.yml)
 
 add_dependencies(modoru_user modoru_kernel_stubs)
-add_dependencies(modoru modoru_patch.skprx)
-add_dependencies(modoru modoru_kernel.skprx)
-add_dependencies(modoru modoru_user_stubs)
-add_dependencies(modoru modoru_user.suprx)
-
-vita_create_vpk(modoru.vpk ${VITA_TITLEID} eboot.bin
-  VERSION ${VITA_VERSION}
-  NAME ${VITA_APP_NAME}
-  FILE ${CMAKE_BINARY_DIR}/modoru_patch.skprx modoru_patch.skprx
-  FILE ${CMAKE_BINARY_DIR}/modoru_kernel.skprx modoru_kernel.skprx
-  FILE ${CMAKE_BINARY_DIR}/modoru_user.suprx modoru_user.suprx
-  FILE ${CMAKE_SOURCE_DIR}/pkg/icon0.png sce_sys/icon0.png
-  FILE ${CMAKE_SOURCE_DIR}/pkg/template.xml sce_sys/livearea/contents/template.xml
-  FILE ${CMAKE_SOURCE_DIR}/pkg/bg0.png sce_sys/livearea/contents/bg0.png
-  FILE ${CMAKE_SOURCE_DIR}/pkg/startup.png sce_sys/livearea/contents/startup.png
-)
+add_dependencies(modoru tiny_modoru.skprx)
+add_dependencies(modoru tiny_modoru.suprx)

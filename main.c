@@ -26,21 +26,20 @@
 
 #include "pspdebug.h"
 
-#include "modoru.h"
-
 #define printf psvDebugScreenPrintf
-
-#define APP_PATH "ux0:app/MODORU000/"
-#define PUP_PATH APP_PATH "PSP2UPDAT.PUP"
 
 #define CHUNK_SIZE 64 * 1024
 
 #define WHITE  0x00FFFFFF
 #define YELLOW 0x0000FFFF
 
-static SceUID modoru_patch_id = -1, modoru_kernel_id = -1, modoru_user_id = -1;
-
-int unload_modoru_drivers(void);
+int k_modoru_release_updater_patches(void);
+int k_modoru_patch_updater(void);
+int k_modoru_launch_updater(void);
+int k_modoru_detect_plugins(void);
+int k_modoru_get_factory_firmware(void);
+int k_modoru_ctrl_peek_buffer_positive(int port, SceCtrlData* pad_data, int count);
+int k_modoru_add_enso(void* u_eobuf);
 
 void ErrorExit(int milisecs, char *fmt, ...) {
   va_list list;
@@ -54,169 +53,8 @@ void ErrorExit(int milisecs, char *fmt, ...) {
 
   sceKernelDelayThread(milisecs * 1000);
 
-  unload_modoru_drivers();
   sceKernelPowerUnlock(0);
   sceKernelExitProcess(0);
-}
-
-int unload_modoru_drivers(void) {
-  if (modoru_user_id >= 0)
-    sceKernelStopUnloadModule(modoru_user_id, 0, NULL, 0, NULL, NULL);
-  if (modoru_kernel_id >= 0)
-    taiStopUnloadKernelModule(modoru_kernel_id, 0, NULL, 0, NULL, NULL);
-  if (modoru_patch_id >= 0)
-    taiStopUnloadKernelModule(modoru_patch_id, 0, NULL, 0, NULL, NULL);
-
-  return 0;
-}
-
-int load_modoru_drivers(void) {
-  modoru_patch_id = taiLoadStartKernelModule(APP_PATH "modoru_patch.skprx", 0, NULL, 0);
-  if (modoru_patch_id < 0)
-    return modoru_patch_id;
-
-  modoru_kernel_id = taiLoadStartKernelModule(APP_PATH "modoru_kernel.skprx", 0, NULL, 0);
-  if (modoru_kernel_id < 0)
-    return modoru_kernel_id;
-
-  modoru_user_id = sceKernelLoadStartModule(APP_PATH "modoru_user.suprx", 0, NULL, 0, NULL, NULL);
-  if (modoru_user_id < 0)
-    return modoru_user_id;
-
-  return 0;
-}
-
-// by yifanlu
-int extract(const char *pup, const char *psp2swu) {
-  int inf, outf;
-
-  if ((inf = sceIoOpen(pup, SCE_O_RDONLY, 0)) < 0) {
-    return -1;
-  }
-
-  if ((outf = sceIoOpen(psp2swu, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 6)) < 0) {
-    return -1;
-  }
-
-  int ret = -1;
-  int count;
-
-  if (sceIoLseek(inf, 0x18, SCE_SEEK_SET) < 0) {
-    goto end;
-  }
-
-  if (sceIoRead(inf, &count, 4) < 4) {
-    goto end;
-  }
-
-  if (sceIoLseek(inf, 0x80, SCE_SEEK_SET) < 0) {
-    goto end;
-  }
-
-  struct {
-    uint64_t id;
-    uint64_t off;
-    uint64_t len;
-    uint64_t field_18;
-  } __attribute__((packed)) file_entry;
-
-  for (int i = 0; i < count; i++) {
-    if (sceIoRead(inf, &file_entry, sizeof(file_entry)) != sizeof(file_entry)) {
-      goto end;
-    }
-
-    if (file_entry.id == 0x200) {
-      break;
-    }
-  }
-
-  if (file_entry.id == 0x200) {
-    char buffer[1024];
-    size_t rd;
-
-    if (sceIoLseek(inf, file_entry.off, SCE_SEEK_SET) < 0) {
-      goto end;
-    }
-
-    while (file_entry.len && (rd = sceIoRead(inf, buffer, sizeof(buffer))) > 0) {
-      if (rd > file_entry.len) {
-        rd = file_entry.len;
-      }
-      sceIoWrite(outf, buffer, rd);
-      file_entry.len -= rd;
-    }
-
-    if (file_entry.len == 0) {
-      ret = 0;
-    }
-  }
-
-end:
-  sceIoClose(inf);
-  sceIoClose(outf);
-  return ret;
-}
-
-int copy(const char *src, const char *dst) {
-  int res;
-  SceUID fdsrc = -1, fddst = -1;
-  void *buf = NULL;
-
-  res = fdsrc = sceIoOpen(src, SCE_O_RDONLY, 0);
-  if (res < 0)
-    goto err;
-
-  res = fddst = sceIoOpen(dst, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-  if (res < 0)
-    goto err;
-
-  buf = memalign(4096, CHUNK_SIZE);
-  if (!buf) {
-    res = -1;
-    goto err;
-  }
-
-  do {
-    res = sceIoRead(fdsrc, buf, CHUNK_SIZE);
-    if (res > 0)
-      res = sceIoWrite(fddst, buf, res);
-  } while (res > 0);
-
-err:
-  if (buf)
-    free(buf);
-  if (fddst >= 0)
-    sceIoClose(fddst);
-  if (fdsrc >= 0)
-    sceIoClose(fdsrc);
-
-  return res;
-}
-
-int remove_dir(const char *path) {
-  SceUID dfd = sceIoDopen(path);
-  if (dfd >= 0) {
-    int res = 0;
-
-    do {
-      SceIoDirent dir;
-      memset(&dir, 0, sizeof(SceIoDirent));
-
-      res = sceIoDread(dfd, &dir);
-      if (res > 0) {
-        char *new_path = malloc(strlen(path) + strlen(dir.d_name) + 2);
-        snprintf(new_path, 1024, "%s/%s", path, dir.d_name);
-        remove_dir(new_path);
-        free(new_path);
-      }
-    } while (res > 0);
-
-    sceIoDclose(dfd);
-
-    return sceIoRmdir(path);
-  } else {
-    return sceIoRemove(path);
-  }
 }
 
 void firmware_string(char string[8], unsigned int version) {
@@ -257,29 +95,34 @@ void wait_confirm(const char *msg) {
   sceKernelDelayThread(500 * 1000);
 }
 
+int addEnso(void) {
+  SceUID fd = sceIoOpen("ud0:enso.eo", SCE_O_RDONLY, 0);
+  if (fd < 0)
+    return 0;
+  char* tmp_ensonx_blk = malloc(0x2E * 0x200);
+  sceIoRead(fd, tmp_ensonx_blk, 0x2E * 0x200);
+  sceIoClose(fd);
+  if (k_modoru_add_enso(tmp_ensonx_blk) < 0)
+    return 0;
+  return 1;
+}
+
 int main(int argc, char *argv[]) {
   int res;
-  int bypass = 0;
+  int bypass = 0, installEnso = 0;
 
   psvDebugScreenInit();
   sceKernelPowerLock(0);
 
-  printf("-- modoru v2.1\n");
-  printf("   by TheFloW\n\n");
-
-  if (sceIoDevctl("ux0:", 0x3001, NULL, 0, NULL, 0) == 0x80010030)
-    ErrorExit(10000, "Enable unsafe homebrew first before using this software.\n");
-
-  res = load_modoru_drivers();
-  if (res < 0)
-    ErrorExit(10000, "Error 0x%08X loading drivers.\n", res);
+  printf("-- modoru v2.1 (tiny)\n");
+  printf("   by TheFloW, mod by SKGleba\n\n");
 
   SceKernelFwInfo fwinfo;
   fwinfo.size = sizeof(SceKernelFwInfo);
   _vshSblGetSystemSwVersion(&fwinfo);
 
   unsigned int current_version = (unsigned int)fwinfo.version;
-  unsigned int factory_version = modoru_get_factory_firmware();
+  unsigned int factory_version = k_modoru_get_factory_firmware();
 
   char current_fw[8], factory_fw[8];
   firmware_string(current_fw, current_version);
@@ -298,32 +141,21 @@ int main(int argc, char *argv[]) {
   printf("\n\n");
 
   SceCtrlData pad;
-  modoru_ctrl_peek_buffer_positive(0, &pad, 1);
+  k_modoru_ctrl_peek_buffer_positive(0, &pad, 1);
   if (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_R1)) {
     bypass = 1;
   }
 
   if (!bypass) {
-    if (scePowerGetBatteryLifePercent() < 50)
-      ErrorExit(10000, "Battery has to be at least at 50%%.\n");
-
-    res = modoru_detect_plugins();
-    if (res < 0) {
-      ErrorExit(10000, "Error 0x%08X detecting plugins.\n", res);
-    } else if (res != 0) {
-      ErrorExit(20000, "Disable all your plugins first before using this software.\n"
-                       "If you have already disabled them, but still get this message,\n"
-                       "reboot your device and launch this software again without\n"
-                       "launching any other applications before (e.g. VitaShell\n"
-                       "or Adrenaline).\n");
-    }
+    if (scePowerGetBatteryLifePercent() < 7)
+      ErrorExit(10000, "Battery has to be at least at 7 percents.\n");
   }
 
   char header[0x80];
 
-  SceUID fd = sceIoOpen(PUP_PATH, SCE_O_RDONLY, 0);
+  SceUID fd = sceIoOpen("ud0:PSP2UPDATE/PSP2UPDAT.PUP", SCE_O_RDONLY, 0);
   if (fd < 0)
-    ErrorExit(10000, "Error 0x%08X opening %s.\n", fd, PUP_PATH);
+    ErrorExit(10000, "Error 0x%08X opening %s.\n", fd, "ud0:PSP2UPDATE/PSP2UPDAT.PUP");
   sceIoRead(fd, header, sizeof(header));
   sceIoClose(fd);
 
@@ -334,10 +166,17 @@ int main(int argc, char *argv[]) {
 
   char target_fw[8];
   firmware_string(target_fw,  target_version);
+  
+  installEnso = addEnso();
 
   printf("Target firmware: ");
   psvDebugScreenSetTextColor(YELLOW);
   printf("%s", target_fw);
+  psvDebugScreenSetTextColor(WHITE);
+  printf("\n");
+  printf(" - install enso: ");
+  psvDebugScreenSetTextColor(YELLOW);
+  printf("%s", (installEnso) ? "yes" : "no");
   psvDebugScreenSetTextColor(WHITE);
   printf("\n\n");
 
@@ -393,30 +232,12 @@ int main(int argc, char *argv[]) {
   wait_confirm("Press X to accept these terms and start the installation,\n"
                "      R to not accept and exit.\n\n");
 
-  printf("Cleaning ud0:...");
-  remove_dir("ud0:");
-  sceIoMkdir("ud0:PSP2UPDATE", 0777);
-  printf("OK\n");
-
-  printf("Copying PSP2UPDAT.PUP to ud0:...");
-  res = copy(PUP_PATH, "ud0:PSP2UPDATE/PSP2UPDAT.PUP");
-  if (res < 0)
-    ErrorExit(10000, "Error 0x%08X copying PSP2UPDAT.PUP.\n", res);
-  printf("OK\n");
-  sceKernelDelayThread(500 * 1000);
-
-  printf("Extracting psp2swu.self...");
-  res = extract("ud0:PSP2UPDATE/PSP2UPDAT.PUP", "ud0:PSP2UPDATE/psp2swu.self");
-  if (res < 0)
-    ErrorExit(10000, "Error 0x%08X extracting psp2swu.self.\n", res);
-  printf("OK\n");
-  sceKernelDelayThread(500 * 1000);
-
   printf("Removing ux0:id.dat...");
   res = sceIoRemove("ux0:id.dat");
-  if (res < 0 && res != 0x80010002)
-    ErrorExit(10000, "Error 0x%08X deleting ux0:id.dat.\n", res);
-  printf("OK\n");
+  if (res < 0)
+    printf("Error 0x%08X deleting ux0:id.dat.\n", res);
+  else
+    printf("OK\n");
   sceKernelDelayThread(500 * 1000);
 
   printf("Starting SCE updater...\n");
@@ -424,18 +245,18 @@ int main(int argc, char *argv[]) {
 
   sceKernelPowerUnlock(0);
 
-  res = modoru_patch_updater();
+  res = k_modoru_patch_updater();
   if (res < 0)
     ErrorExit(10000, "Error 0x%08X patching updater.\n", res);
 
-  res = modoru_launch_updater();
+  res = k_modoru_launch_updater();
   if (res < 0)
     goto err;
 
   sceKernelDelayThread(10 * 1000 * 1000);
 
 err:
-  modoru_release_updater_patches();
+  k_modoru_release_updater_patches();
   ErrorExit(10000, "Error 0x%08X starting SCE updater.\n", res);
 
   return 0;
